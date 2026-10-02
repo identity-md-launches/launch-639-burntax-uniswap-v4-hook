@@ -8,6 +8,7 @@ import {BurnTaxHook} from "../src/BurnTaxHook.sol";
 import {HookFlags} from "../src/HookFlags.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
@@ -176,6 +177,30 @@ contract BurnTaxHookTest is BurnTaxFixture {
         }
     }
 
+    function test_rejectsDynamicFeeAndNonTierFees() public {
+        uint24[5] memory fees = [LPFeeLibrary.DYNAMIC_FEE_FLAG, 0, 100, 2999, LPFeeLibrary.MAX_LP_FEE];
+        for (uint256 i; i < fees.length; ++i) {
+            // Pools containing BTAX and unrelated pools are refused alike.
+            for (uint256 j; j < 2; ++j) {
+                PoolKey memory key = j == 0 ? token0Key : _key(address(low), address(high), address(hook));
+                key.fee = fees[i];
+                key.tickSpacing = 10;
+                vm.expectRevert(
+                    abi.encodeWithSelector(
+                        CustomRevert.WrappedError.selector,
+                        address(hook),
+                        IHooks.beforeInitialize.selector,
+                        abi.encodeWithSelector(BurnTaxHook.UnsupportedPoolFee.selector),
+                        abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+                    )
+                );
+                manager.initialize(key, PRICE);
+                (uint160 price,,,) = manager.getSlot0(key.toId());
+                assertEq(price, 0, "pool stays uninitialized");
+            }
+        }
+    }
+
     function test_allCallbacksRejectUnauthorizedCalls() public {
         SwapParams memory params = _params(true, true, true, 1 ether);
         vm.expectRevert(BurnTaxHook.OnlyPoolManager.selector);
@@ -184,6 +209,18 @@ contract BurnTaxHookTest is BurnTaxFixture {
         hook.beforeSwap(address(manager), token0Key, params, "");
         vm.expectRevert(BurnTaxHook.OnlyPoolManager.selector);
         hook.afterSwap(address(manager), token0Key, params, BalanceDelta.wrap(0), "");
+        vm.expectRevert(BurnTaxHook.OnlyPoolManager.selector);
+        hook.unlockCallback(abi.encode(uint256(1)));
+    }
+
+    function test_burnPendingRevertsWhenNothingIsDeferred() public {
+        assertEq(hook.pendingBurn(), 0);
+        vm.expectRevert(BurnTaxHook.NothingPending.selector);
+        hook.burnPending();
+        _checkTrade(false, true, true, 100 ether);
+        assertEq(hook.pendingBurn(), 0, "funded pools burn directly");
+        vm.expectRevert(BurnTaxHook.NothingPending.selector);
+        hook.burnPending();
     }
 
     function test_predeploymentPoolInitializationFails() public {

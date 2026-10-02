@@ -3,7 +3,9 @@ pragma solidity 0.8.26;
 
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
@@ -12,8 +14,13 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 
 /// @notice Sends 1% of the gross BTAX leg of each swap to DEAD using v4 return deltas.
-/// @dev Implements only the three advertised callbacks. No fallback, custody, admin or upgrade path.
-contract BurnTaxHook {
+/// @dev Implements only the three advertised callbacks plus a permissionless redemption of deferred
+/// burns. No fallback, admin or upgrade path. The hook never holds BTAX as ERC-20; while the
+/// PoolManager's BTAX balance cannot fund an immediate burn, the tax is held as an ERC-6909 claim
+/// that anyone can redeem to DEAD and that the next covered swap redeems on its own.
+contract BurnTaxHook is IUnlockCallback {
+    using LPFeeLibrary for uint24;
+
     IPoolManager public immutable poolManager;
     Currency public immutable launchedToken;
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
@@ -25,10 +32,18 @@ contract BurnTaxHook {
     error InvalidDeploymentParameter();
     error AmountTooLarge();
     error PartialFillWithSpecifiedTax();
+    error UnsupportedPoolFee();
+    error NothingPending();
 
     /// @param isBuy True when the trader receives BTAX, irrespective of its currency ordering.
-    /// @param amount Actual BTAX minor units transferred to DEAD; may round to zero.
+    /// @param amount BTAX minor units taken from the trader's side for burning; may round to zero.
+    /// Delivered to DEAD in the same swap unless a `BurnDeferred` event follows for this swap.
     event Burned(PoolId indexed poolId, bool indexed isBuy, uint256 amount);
+    /// @notice The swap's tax is held as a hook ERC-6909 claim because the PoolManager's BTAX balance
+    /// could not fund the transfer yet (ordinary routers settle the seller's input after afterSwap).
+    event BurnDeferred(PoolId indexed poolId, uint256 amount);
+    /// @notice Previously deferred tax was transferred to DEAD.
+    event DeferredBurnSettled(uint256 amount);
 
     constructor(IPoolManager manager, address token) {
         if (address(manager).code.length == 0 || token.code.length == 0 || token == address(manager)) {
@@ -52,13 +67,36 @@ contract BurnTaxHook {
         permissions.afterSwapReturnDelta = true;
     }
 
-    /// @dev Accepts the pool's own fee and unrelated pools. Also prevents initialization before code exists.
-    function beforeInitialize(address, PoolKey calldata, uint160)
+    /// @notice Deferred tax (BTAX minor units) held as the hook's ERC-6909 claim, not yet at DEAD.
+    function pendingBurn() public view returns (uint256) {
+        return poolManager.balanceOf(address(this), launchedToken.toId());
+    }
+
+    /// @notice Transfers every deferred tax claim to DEAD. Anyone may call; reverts when nothing is pending.
+    function burnPending() external returns (uint256 amount) {
+        amount = pendingBurn();
+        if (amount == 0) revert NothingPending();
+        poolManager.unlock(abi.encode(amount));
+    }
+
+    /// @dev Reached only through this contract's own `burnPending` unlock.
+    function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
+        _settleDeferred(abi.decode(data, (uint256)));
+        return "";
+    }
+
+    /// @dev Accepts the launch fee tiers and unrelated pools. Refuses the dynamic-fee flag, which this hook
+    /// could never set (the LP fee would stay 0 forever), and static fees outside the launch tiers.
+    /// Also prevents initialization before the hook has code.
+    function beforeInitialize(address, PoolKey calldata key, uint160)
         external
         view
         onlyPoolManager
         returns (bytes4)
     {
+        if (key.fee.isDynamicFee() || (key.fee != 500 && key.fee != 3000 && key.fee != 10_000)) {
+            revert UnsupportedPoolFee();
+        }
         return IHooks.beforeInitialize.selector;
     }
 
@@ -107,11 +145,34 @@ contract BurnTaxHook {
             returnedFee = int128(int256(fee));
         }
 
-        // Creates a debit exactly canceled by the positive hook return delta. Never holds BTAX.
-        // The manager needs this much BTAX before the router settles (see README).
-        if (fee != 0) poolManager.take(launchedToken, DEAD, fee);
-        emit Burned(key.toId(), isBuy, fee);
+        _burn(key, isBuy, fee);
         return (IHooks.afterSwap.selector, returnedFee);
+    }
+
+    /// @dev Both `take` and `mint` debit the hook by `fee`; the positive return delta cancels that debit
+    /// exactly, so the hook ends every swap with zero currency delta and never holds BTAX as ERC-20.
+    /// `take` is an immediate ERC-20 transfer out of the manager's balance, and an ordinary router
+    /// settles the seller's BTAX only after this callback, so it is used only when that balance already
+    /// covers the transfer; otherwise the tax is minted as a hook claim (redeemable by anyone).
+    function _burn(PoolKey calldata key, bool isBuy, uint256 fee) private {
+        uint256 reserves = launchedToken.balanceOf(address(poolManager));
+        emit Burned(key.toId(), isBuy, fee);
+        if (reserves < fee) {
+            poolManager.mint(address(this), launchedToken.toId(), fee);
+            emit BurnDeferred(key.toId(), fee);
+            return;
+        }
+        // A covered swap also redeems earlier deferred tax once the balance covers both.
+        uint256 pending = pendingBurn();
+        if (pending != 0 && reserves >= fee + pending) _settleDeferred(pending);
+        if (fee != 0) poolManager.take(launchedToken, DEAD, fee);
+    }
+
+    /// @dev Burning the claim credits the hook by `amount`; taking it to DEAD debits the same amount.
+    function _settleDeferred(uint256 amount) private {
+        poolManager.burn(address(this), launchedToken.toId(), amount);
+        poolManager.take(launchedToken, DEAD, amount);
+        emit DeferredBurnSettled(amount);
     }
 
     function _containsToken(PoolKey calldata key) private view returns (bool) {
