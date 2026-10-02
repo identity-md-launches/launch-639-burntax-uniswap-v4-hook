@@ -16,6 +16,7 @@ import {SwapParams, ModifyLiquidityParams} from "v4-core/src/types/PoolOperation
 import {BalanceDelta, toBalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
+import {Pool} from "v4-core/src/libraries/Pool.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 
@@ -137,25 +138,39 @@ contract BurnTaxHookEdgesTest is BurnTaxFixture {
         }
     }
 
-    /// @dev `beforeInitialize` accepts the dynamic-fee flag. Such a pool starts at a 0 LP fee and
-    /// nothing can ever raise it: only the hook may call `updateDynamicLPFee` and it has no such
-    /// function. The tax still applies. Recorded as a limit in the findings file, not a defect the
-    /// brief rules out.
-    function test_dynamicFeePoolIsTaxedButKeepsAZeroLpFeeForever() public {
+    /// @dev A dynamic-fee pool would start at a 0 LP fee that nothing could ever raise: only the hook
+    /// may call `updateDynamicLPFee` and it has no such function. `beforeInitialize` therefore refuses
+    /// the flag, so a permanently zero-fee taxed pool cannot come into existence, and a swap aimed at
+    /// one fails in the PoolManager before any hook callback runs.
+    function test_dynamicFeePoolCannotBeCreatedWithThisHook() public {
         PoolKey memory key = token0Key;
         key.fee = LPFeeLibrary.DYNAMIC_FEE_FLAG;
-        _seed(key);
-        (,,, uint24 lpFee) = manager.getSlot0(key.toId());
-        assertEq(lpFee, 0);
 
         vm.expectRevert(IPoolManager.UnauthorizedDynamicLPFeeUpdate.selector);
         manager.updateDynamicLPFee(key, 3000);
 
-        vm.expectEmit(true, true, false, true, address(hook));
-        emit Burned(key.toId(), false, 1 ether);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(hook),
+                IHooks.beforeInitialize.selector,
+                abi.encodeWithSelector(BurnTaxHook.UnsupportedPoolFee.selector),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        manager.initialize(key, PRICE);
+        (uint160 price,,, uint24 lpFee) = manager.getSlot0(key.toId());
+        assertEq(price, 0, "the pool was never created");
+        assertEq(lpFee, 0);
+
+        vm.recordLogs();
+        vm.expectRevert(Pool.PoolNotInitialized.selector);
         _swap(key, _params(false, true, true, 100 ether));
-        (,,, lpFee) = manager.getSlot0(key.toId());
-        assertEq(lpFee, 0, "the hook never overrides the LP fee");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertNotEq(logs[i].emitter, address(hook), "no hook callback ran");
+        }
+        assertEq(token.balanceOf(DEAD), 0);
         _assertSettled(key);
     }
 
