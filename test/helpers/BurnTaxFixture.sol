@@ -44,8 +44,8 @@ abstract contract BurnTaxFixture is Test {
         token = new BurnTaxToken();
         low = MockERC20(address(0x1000));
         high = MockERC20(address(type(uint160).max - 1));
-        deployCodeTo("MockERC20.sol:MockERC20", abi.encode("Low", "LOW", SUPPLY), address(low));
-        deployCodeTo("MockERC20.sol:MockERC20", abi.encode("High", "HIGH", SUPPLY), address(high));
+        _deployMockAt(address(low), "Low", "LOW");
+        _deployMockAt(address(high), "High", "HIGH");
         assertLt(uint160(address(low)), uint160(address(token)));
         assertLt(uint160(address(token)), uint160(address(high)));
 
@@ -65,6 +65,17 @@ abstract contract BurnTaxFixture is Test {
         _seed(token1Key);
         _seed(_control(token0Key));
         _seed(_control(token1Key));
+    }
+
+    /// @dev Runs the mock's constructor in place at a fixed address so both currency orderings exist.
+    /// Uses the compiled creation code directly: no artifact lookup, so no filesystem permission is needed.
+    function _deployMockAt(address at, string memory name_, string memory symbol_) internal {
+        bytes memory creation =
+            abi.encodePacked(type(MockERC20).creationCode, abi.encode(name_, symbol_, SUPPLY));
+        vm.etch(at, creation);
+        (bool ok, bytes memory runtime) = at.call("");
+        require(ok, "mock constructor reverted");
+        vm.etch(at, runtime);
     }
 
     function _deployHook(IPoolManager atManager) internal returns (BurnTaxHook deployed) {
